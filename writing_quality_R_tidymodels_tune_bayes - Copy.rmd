@@ -1,13 +1,13 @@
 ---
 title: ''
-output: html_document
+author: "Arnold Kakas"
 date: "`r Sys.Date()`"
+output: html_document
 ---
 
-
-https://www.kaggle.com/code/mcpenguin/writing-processes-to-quality-baseline
-https://www.kaggle.com/code/pehahn/xgb-base-in-r
-https://juliasilge.com/blog/xgboost-tune-volleyball/
+<https://www.kaggle.com/code/mcpenguin/writing-processes-to-quality-baseline> 
+<br><https://www.kaggle.com/code/pehahn/xgb-base-in-r> 
+<br><https://juliasilge.com/blog/xgboost-tune-volleyball/>
 
 
 ## Load packages and data
@@ -15,13 +15,21 @@ https://juliasilge.com/blog/xgboost-tune-volleyball/
 ```{r}
 pacman::p_load(tidyverse,
                tidymodels,
+               bonsai,
                corrplot,
+               patchwork,
                ggplot2,
-               ggridges,
-               finetune,
+               plotly,
                vip,
                doParallel,
                tictoc)
+```
+
+```{r}
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list = ls(name = env), pos = env)
+}
 ```
 
 ```{r}
@@ -38,6 +46,8 @@ sample_submission <- read_csv('sample_submission.csv', show_col_types = FALSE)
 ```
 
 ## Feature engineering
+
+### Functions
 
 ```{r}
 # lists
@@ -97,6 +107,7 @@ text_change_counts <- function(df) {
 }
 
 # Function to get input words
+# Function to get input words
 input_words <- function(df) {
   tmp_df <- df %>%
     filter(!str_detect(text_change, '=>'), text_change != 'NoChange') %>%
@@ -104,22 +115,84 @@ input_words <- function(df) {
     summarise(text_change = list(text_change)) %>%
     mutate(text_change = map_chr(text_change, ~paste(.x, collapse = ""))) %>%
     mutate(
-      input_word_count = map_int(text_change, ~sum(str_count(.x, 'q+')))
+      input_word_count = map_int(text_change, ~sum(str_count(.x, 'q+'))
+    )) %>%
+    mutate(
+      input_word_length_mean = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(mean(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_geometric_mean = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(exp(mean(log(word_lengths))))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_iqr = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(IQR(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_sd = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(sd(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
     )
   
-tmp_df$input_word_length_mean <- sapply(tmp_df$text_change, function(x) {
-  if (length(x) > 0) {
-    word_lengths <- unlist(map(punctuation, ~str_count(x, .x)))
-    return(mean(word_lengths))
-  } else {
-    return(0)
-  }
-})
-
+  
+  
 tmp_df <- tmp_df %>% 
   select(-text_change)
   return(tmp_df)
+
+  return(tmp_df)
 }
+
+
+
 
 # Function to make time lags
 time_lags <- function(df, lags) {
@@ -140,11 +213,14 @@ time_lags <- function(df, lags) {
 
 ```
 
+### Features
+
 ```{r}
 
-train_logs <- time_lags(train_logs, lags)
-Missing <- setdiff(lag_cols, names(train_logs))  # Find names of missing columns (mostly due to test data)
-train_logs[Missing] <- 0                    # Add them, filled with '0's (mostly due to test data)
+train_logs_adj <- time_lags(train_logs, lags)
+
+Missing <- setdiff(lag_cols, names(train_logs_adj))  # Find names of missing columns (mostly due to test data)
+train_logs_adj[Missing] <- 0                    # Add them, filled with '0's (mostly due to test data)
 
 
 
@@ -153,13 +229,15 @@ train_logs_2 <- event_counts(train_logs)
 train_logs_3 <- text_change_counts(train_logs)
 train_logs_4 <- input_words(train_logs)
 
-train_logs_adj <- train_logs %>% 
-  mutate(IKI = down_time - lag(up_time, default = 0),
+train_logs_adj <- train_logs_adj %>% 
+  group_by(id) %>% 
+  mutate(IKI = down_time - lag(down_time, default = 1),
          pause = if_else(IKI >= pause_threshold, 1, 0),
          is_char = ifelse(text_change != "NoChange",str_length(text_change),0),
          is_char = ifelse(is.na(is_char),1,is_char),
          p = if_else(IKI <= burst_threshold & activity != "Nonproduction", 1, 0),
          p_burst = cumsum(p)+1) %>% 
+  ungroup() %>% 
   group_by(p_burst) %>% 
   mutate(p_burst_length = sum(activity == "Input")) %>% 
   ungroup() %>% 
@@ -174,10 +252,9 @@ train_logs_adj <- train_logs %>%
             keep = FALSE) %>% 
   left_join(train_logs_4,
             join_by(id),
-            keep = FALSE)
-
-
-colnames(train_logs_adj)
+            keep = FALSE) %>% 
+  mutate(across(where(is.numeric), ~replace_na(.x, 1))) # due to lag columns
+  
 
 
 train_df <- train_logs_adj %>%  
@@ -190,20 +267,23 @@ train_df <- train_logs_adj %>%
     first_time = round(min(down_time)/1000,0),
     pauses = sum(pause),
     pauses_share = round(pauses/time,3),
+    IKI_geometric_mean = exp(mean(log(IKI))),
     typing_speed = round(word_count/time,3),
     p_burst = n_distinct(p_burst),
     p_burst_per_min = round(p_burst/(net_time/60),0),
     p_burst_length = round(mean(p_burst_length),0),
     action_time_gap25_mean = mean(action_time_gap25, na.rm = TRUE),
+    action_time_gap25_geometric_mean = exp(mean(log(action_time_gap25))),
     action_time_gap25_min = min(action_time_gap25, na.rm = TRUE),
     action_time_gap25_max = max(action_time_gap25, na.rm = TRUE),
     action_time_gap50_mean = mean(action_time_gap50, na.rm = TRUE),
+    action_time_gap50_geometric_mean = exp(mean(log(action_time_gap50))),
     action_time_gap50_min = min(action_time_gap50, na.rm = TRUE),
     action_time_gap50_max = max(action_time_gap50, na.rm = TRUE),
-    action_time_gap50_mean = mean(action_time_gap50, na.rm = TRUE),
     action_time_gap100_min = min(action_time_gap100, na.rm = TRUE),
     action_time_gap100_max = max(action_time_gap100, na.rm = TRUE),
     action_time_gap100_mean = mean(action_time_gap100, na.rm = TRUE),
+    action_time_gap100_geometric_mean = exp(mean(log(action_time_gap100))),
     activity_Input = mean(activity_Input , na.rm = TRUE),
     activity_Nonproduction = mean(activity_Nonproduction , na.rm = TRUE),
     activity_Paste = mean(activity_Paste , na.rm = TRUE),
@@ -231,27 +311,25 @@ train_df <- train_logs_adj %>%
     text_change_q = mean(text_change_q , na.rm = TRUE),
     input_word_count = mean(input_word_count , na.rm = TRUE),
     input_word_length_mean = mean(input_word_length_mean , na.rm = TRUE),
-input_word_length_min = min(input_word_length_mean , na.rm = TRUE),
-input_word_length_man = max(input_word_length_mean , na.rm = TRUE),
-input_word_length_std = sd(input_word_length_mean , na.rm = TRUE),
-    chars_per_min = round((last_pos - event_Space)/(net_time/60),0),
+    input_word_length_geometric_mean = mean(input_word_length_geometric_mean , na.rm = TRUE),
     accuracy = round((activity_Input - activity_Replace -  `activity_Remove/Cut`)/activity_Input,3)
     ) %>% 
   left_join(train_scores,
             join_by(id),
-            keep = FALSE) %>% 
-  filter(chars_per_min > 0)
+            keep = FALSE)
+
+
 ```
 
+## EDA
 
-## Summary of train dataframe
+### Summary of train dataframe
 
 ```{r}
 summary(train_df)
 ```
 
-
-## Distributions
+### Distributions
 ```{r}
 dist_train_df <- train_df %>% 
   pivot_longer(cols = -id,
@@ -270,7 +348,7 @@ print(p)
 ```
 
 
-## Scatterplots of score with other features
+### Scatterplots of score with other features
 ```{r message=FALSE, warning=FALSE}
 point_train_df <- train_df %>% 
   pivot_longer(cols = -c(id, score),
@@ -289,7 +367,7 @@ print(p)
 }
 ```
 
-## Correlations
+### Correlations
 
 There are (unsurprisingly) some highly correlated variables
 
@@ -298,21 +376,22 @@ train_corr <- train_df %>% select(-id) %>% cor()
 corrplot(train_corr)
 ```
 
-
 ## Model preparation
+
+### Specification
+
 ```{r}
 set.seed(123)
 train_split <- initial_split(train_df %>% select(-id) , prop = 0.7, strata = score)
 train_data <- training(train_split)
 test_data <- testing(train_split)
 
-train_folds <- vfold_cv(train_data, v = 10)
+train_folds <- vfold_cv(train_data, v = 5)
 
 model_rec <- recipe(score~., data = train_data) %>%
   step_zv(all_predictors()) %>% 
   step_normalize(all_predictors()) %>%
   step_center(all_predictors()) %>%
-  step_YeoJohnson(all_numeric_predictors()) %>% 
   step_pca()
   #step_corr(all_predictors(), threshold = 0.9) # removing correlated features as redundant
 
@@ -327,101 +406,168 @@ xgb_wf <- workflow() %>%
         add_recipe(model_rec) %>%
         add_model(xgb_spec)
 
-xgb_grid <- grid_latin_hypercube(
-  trees(),
-  tree_depth(),
-  min_n(),
+xgb_params <- parameters(
+  trees(c(200, 500)), learn_rate(),
+  tree_depth(), min_n(), 
   loss_reduction(),
-  sample_size = sample_prop(),
-  finalize(mtry(), train_data),
-  learn_rate(),
-  size = 20
+  sample_size = sample_prop(), finalize(mtry(), train_data)  
 )
 ```
 
-```{r eval=FALSE, include=FALSE}
-registerDoParallel(detectCores() - 2)
-
-tic()
-
-set.seed(234)
-xgb_res <- tune_grid(
-  xgb_wf,
-  resamples = train_folds,
-  grid = xgb_grid,
-  control = control_grid(save_pred = TRUE)
-)
-
-toc()
-
-doParallel::stopImplicitCluster()
-
-xgb_res
-
-best_rmse <- select_best(xgb_res, "rmse")
-
-final_xgb <- finalize_workflow(
-  xgb_wf,
-  best_rmse
-)
-
-model_fit <- last_fit(final_xgb, train_split)
-```
+### Grid tuning with tidymodels
 
 ```{r}
 registerDoParallel(detectCores() - 2)
 
 tic()
-set.seed(1308)
+set.seed(123)
 
-xgb_param <- extract_parameter_set_dials(xgb_wf)
-rmse_class <- metric_set(rmse, rsq)
 
-xgb_race <-
-  xgb_wf %>%
-  tune_race_anova(
-    train_folds,
-    grid = 20,
-    param_info = xgb_param,
-    metrics = rmse_class,
-    control = control_race(save_pred = TRUE, verbose_elim = TRUE)
+xgb_res <-
+  tune_bayes(
+    xgb_wf,
+    resamples = train_folds,
+    param_info = xgb_params,
+    iter = 100, 
+    metrics = metric_set(rmse, mape, rsq),
+    control = control_bayes(no_improve = 10, 
+                            save_pred = TRUE,
+                            verbose = TRUE)
   )
 
 toc()
 
-doParallel::stopImplicitCluster()
+unregister_dopar()
 
-collect_metrics(xgb_race)
+collect_metrics(xgb_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
 
 
+```{r eval=FALSE, include=FALSE}
+# results rmse
+p <- xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  select(mean, trees:mtry) %>%
+  pivot_longer(trees:mtry,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "rmse")
+
+ggplotly(p)
+```
+
+```{r eval=FALSE, include=FALSE}
+# results rsq
+p <- xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "rsq") %>%
+  select(mean, trees:mtry) %>%
+  pivot_longer(trees:mtry,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "rsq")
+
+ggplotly(p)
+```
+
+```{r}
 best_results <- 
-        xgb_race %>% 
-        select_best(metric = "rmse")
+        select_best(xgb_res, metric = "rmse")
+
+best_results
+```
+
+### Test the model
+
+```{r}
+# predict on test data
+
+final_model <- finalize_model(xgb_spec, best_results)
+final_workflow    <- xgb_wf %>% update_model(final_model)
+final_xgb_fit     <- fit(final_workflow, data = train_data)
+
+pred <- predict(final_xgb_fit, test_data) %>% 
+  bind_cols(test_data)
+```
 
 
-boosting_final <- 
-   xgb_wf %>% 
-   finalize_workflow(best_results) %>% 
-   last_fit(split = train_split)
+```{r}
+# prediction results
+g1 <- 
+  pred %>% 
+  ggplot(aes(x = .pred, y = score))+
+  geom_point()+ 
+  geom_abline(intercept = 0, col = "red")
 
-final_xgb <- finalize_workflow(
-  xgb_wf,
-  best_results
-)
 
-final_xgb %>%
-  fit(data = train_data) %>%
-  pull_workflow_fit() %>%
-  vip(geom = "point",
-      num_features = 20L)
+g2 <- 
+  pred %>% 
+  select(.pred, score) %>% 
+  gather(key, value) %>% 
+  ggplot(aes(x=value, volor = key, fill = key)) + 
+  geom_density(alpha=.2)+ 
+  labs(x = "", y = "")
 
-collect_metrics(boosting_final)
+g1 / g2
 ```
 
 
 
 
-### Predicting 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# finalize workflow
+xg_fit_rs <- 
+   xgb_wf %>% 
+   finalize_workflow(best_results) %>% 
+   last_fit(split = train_split)
+
+
+```
+
+
+```{r}
+# feature importance
+xg_fit_rs %>%
+  fit(data = train_data) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point", 
+      num_features = 20)
+```
+
+### Predicting
 
 ```{r}
 test_logs <- time_lags(test_logs, lags)
@@ -514,7 +660,6 @@ test_df <- test_logs_adj %>%
     input_word_length_mean = mean(input_word_length_mean , na.rm = TRUE),
 input_word_length_min = min(input_word_length_mean , na.rm = TRUE),
 input_word_length_man = max(input_word_length_mean , na.rm = TRUE),
-input_word_length_std = sd(input_word_length_mean , na.rm = TRUE),
     chars_per_min = round((last_pos - event_Space)/(net_time/60),0),
     accuracy = round((activity_Input - activity_Replace -  `activity_Remove/Cut`)/activity_Input,3)
     ) %>% 
@@ -542,4 +687,8 @@ pred_test <- predict(fitted_xgb, new_data = test_df)
 sample_submission$score <- pred_test$.pred
 write_csv(sample_submission, "submission.csv")
 ```
+
+
+
+
 
