@@ -19,6 +19,8 @@ pacman::p_load(tidyverse,
                corrplot,
                patchwork,
                ggplot2,
+               ggpubr, # regline equation
+               ggpmisc, # R squared value in plots
                plotly,
                vip,
                doParallel,
@@ -253,8 +255,11 @@ train_logs_adj <- train_logs_adj %>%
   left_join(train_logs_4,
             join_by(id),
             keep = FALSE) %>% 
-  mutate(across(where(is.numeric), ~replace_na(.x, 1))) # due to lag columns
-  
+  mutate(across(where(is.numeric), ~replace_na(.x, 1)), # due to lag columns
+         IKI = if_else(IKI <= 0, 1, IKI),
+          action_time_gap25 = if_else(action_time_gap25 <= 0, 1, action_time_gap25),
+          action_time_gap50 = if_else(action_time_gap50 <= 0, 1, action_time_gap50),
+          action_time_gap100 = if_else(action_time_gap100 <= 0, 1, action_time_gap100))
 
 
 train_df <- train_logs_adj %>%  
@@ -274,13 +279,10 @@ train_df <- train_logs_adj %>%
     p_burst_length = round(mean(p_burst_length),0),
     action_time_gap25_mean = mean(action_time_gap25, na.rm = TRUE),
     action_time_gap25_geometric_mean = exp(mean(log(action_time_gap25))),
-    action_time_gap25_min = min(action_time_gap25, na.rm = TRUE),
     action_time_gap25_max = max(action_time_gap25, na.rm = TRUE),
     action_time_gap50_mean = mean(action_time_gap50, na.rm = TRUE),
     action_time_gap50_geometric_mean = exp(mean(log(action_time_gap50))),
-    action_time_gap50_min = min(action_time_gap50, na.rm = TRUE),
     action_time_gap50_max = max(action_time_gap50, na.rm = TRUE),
-    action_time_gap100_min = min(action_time_gap100, na.rm = TRUE),
     action_time_gap100_max = max(action_time_gap100, na.rm = TRUE),
     action_time_gap100_mean = mean(action_time_gap100, na.rm = TRUE),
     action_time_gap100_geometric_mean = exp(mean(log(action_time_gap100))),
@@ -360,6 +362,11 @@ for (i in point_measures) {
 p <- ggplot(point_train_df %>% filter(measure == i), aes(x = score, y = value)) +
     geom_point() +
     geom_smooth(method = lm, formula = y ~ x) + #add linear trend line
+  stat_poly_eq(formula = y ~ x, 
+               aes(label = paste(..eq.label.., ..rr.label.., ..p.value.label.., sep = "*`,`~")), 
+               parse = TRUE,
+               label.x.npc = "right",
+               vstep = 0.05) + # sets vertical spacing +
   labs(y = i,
        x = "points")
 
@@ -367,12 +374,31 @@ print(p)
 }
 ```
 
+### Select features based on EDA
+
+```{r}
+train_df_model <- train_df %>% 
+  select(-c(accuracy,
+            input_word_length_geometric_mean,
+            pauses_share,
+            activity_Paste,
+            event_Unidentified,
+            event_ArrowUp,
+            event_Delete,
+            event_Enter,
+            event_Leftclick
+            ))
+```
+
+
+
+
 ### Correlations
 
 There are (unsurprisingly) some highly correlated variables
 
 ```{r}
-train_corr <- train_df %>% select(-id) %>% cor()
+train_corr <- train_df_model %>% select(-id) %>% cor()
 corrplot(train_corr)
 ```
 
@@ -382,11 +408,11 @@ corrplot(train_corr)
 
 ```{r}
 set.seed(123)
-train_split <- initial_split(train_df %>% select(-id) , prop = 0.7, strata = score)
+train_split <- initial_split(train_df_model %>% select(-id) , prop = 0.7, strata = score)
 train_data <- training(train_split)
 test_data <- testing(train_split)
 
-train_folds <- vfold_cv(train_data, v = 5)
+train_folds <- vfold_cv(train_data, v = 10)
 
 model_rec <- recipe(score~., data = train_data) %>%
   step_zv(all_predictors()) %>% 
@@ -446,42 +472,6 @@ collect_metrics(xgb_res)
 autoplot(xgb_res)
 ```
 
-
-```{r eval=FALSE, include=FALSE}
-# results rmse
-p <- xgb_res %>%
-  collect_metrics() %>%
-  filter(.metric == "rmse") %>%
-  select(mean, trees:mtry) %>%
-  pivot_longer(trees:mtry,
-               values_to = "value",
-               names_to = "parameter"
-  ) %>%
-  ggplot(aes(value, mean, color = parameter)) +
-  geom_point(alpha = 0.8, show.legend = FALSE) +
-  facet_wrap(~parameter, scales = "free_x") +
-  labs(x = NULL, y = "rmse")
-
-ggplotly(p)
-```
-
-```{r eval=FALSE, include=FALSE}
-# results rsq
-p <- xgb_res %>%
-  collect_metrics() %>%
-  filter(.metric == "rsq") %>%
-  select(mean, trees:mtry) %>%
-  pivot_longer(trees:mtry,
-               values_to = "value",
-               names_to = "parameter"
-  ) %>%
-  ggplot(aes(value, mean, color = parameter)) +
-  geom_point(alpha = 0.8, show.legend = FALSE) +
-  facet_wrap(~parameter, scales = "free_x") +
-  labs(x = NULL, y = "rsq")
-
-ggplotly(p)
-```
 
 ```{r}
 best_results <- 
