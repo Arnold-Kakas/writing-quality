@@ -538,10 +538,18 @@ train_folds <- vfold_cv(train_data, v = 7)
 # Recipe
 model_rec <- recipe(score~., data = train_data) %>%
   step_zv(all_predictors()) %>% 
+  step_corr(all_predictors(), threshold = 0.9) %>% # removing correlated features as redundant
+  step_lincomb(all_predictors()) %>% 
   step_normalize(all_predictors()) %>%
-  step_center(all_predictors())# %>%
-  #step_pca()
-  #step_corr(all_predictors(), threshold = 0.9) # removing correlated features as redundant
+  step_center(all_predictors())
+
+model_rec_glm <- recipe(score~., data = train_data) %>%
+  step_zv(all_predictors()) %>% 
+  step_corr(all_predictors(), threshold = 0.9) %>%  # removing correlated features as redundant
+  step_lincomb(all_predictors()) %>% 
+  step_normalize(all_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_pca()
 ```
 
 ```{r}
