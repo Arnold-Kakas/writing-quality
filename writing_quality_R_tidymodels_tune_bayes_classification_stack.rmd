@@ -218,16 +218,6 @@ time_lags <- function(df, lags) {
 
 ### Features
 
-To add:
-         feats['word_time_ratio'] = feats['word_count_max'] / feats['up_time_max']
-        feats['word_event_ratio'] = feats['word_count_max'] / feats['event_id_max']
-        feats['event_time_ratio'] = feats['event_id_max']  / feats['up_time_max']
-        feats['idle_time_ratio'] = feats['action_time_gap1_sum'] / feats['up_time_max']
-        
-        	action_time_std
-        	
-        	remove outliers
-        	
 
 ```{r}
 
