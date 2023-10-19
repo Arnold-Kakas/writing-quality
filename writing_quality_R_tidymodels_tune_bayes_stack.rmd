@@ -5,13 +5,6 @@ date: "`r Sys.Date()`"
 output: html_document
 ---
 
-```{r setup, include=FALSE, eval=TRUE}
-knitr::opts_chunk$set(
-	message = FALSE,
-	warning = FALSE
-)
-```
-
 <https://www.kaggle.com/code/mcpenguin/writing-processes-to-quality-baseline> 
 <br><https://www.kaggle.com/code/pehahn/xgb-base-in-r> 
 <br><https://juliasilge.com/blog/xgboost-tune-volleyball/>
@@ -23,7 +16,6 @@ knitr::opts_chunk$set(
 pacman::p_load(tidyverse,
                tidymodels,
                bonsai, # lightgbm
-               brulee,
                keras, # neural network
                rlang,
                corrplot,
@@ -522,7 +514,10 @@ train_corr_2 <- train_df_reduced_2 %>% select(-id) %>% cor()
 corrplot(train_corr_2)
 ```
 
+### Change to factor
 ```{r}
+train_df_reduced_2$score <- factor(train_df_reduced_2$score)
+
 train_df_reduced_2 <- train_df_reduced_2 %>% clean_names()
 ```
 
@@ -560,8 +555,6 @@ model_rec_glm <- recipe(score~., data = train_data) %>%
   step_pca()
 ```
 
-
-
 ```{r}
 # xgboost
 xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), min_n = tune(), loss_reduction = tune(), ## model complexity
@@ -569,14 +562,14 @@ xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), min_n = tune(), loss
                        learn_rate = tune() ## step size
                        ) %>%
         set_engine("xgboost") %>% 
-        set_mode("regression")
+        set_mode("classification")
 
 xgb_wf <- workflow() %>% 
         add_recipe(model_rec) %>%
         add_model(xgb_spec)
 
 xgb_params <- parameters(
-  trees(c(200, 700)), learn_rate(),
+  trees(c(300, 700)), learn_rate(),
   tree_depth(), min_n(), 
   loss_reduction(),
   sample_size = sample_prop(), finalize(mtry(), train_data)  
@@ -585,23 +578,22 @@ xgb_params <- parameters(
 
 ```{r}
 # lightgbm 
-lgbm_spec <- boost_tree(trees = tune(), tree_depth = tune(), min_n = tune(), 
-                        loss_reduction = tune(), learn_rate = tune(),
-                        sample_size = tune()
+lgbm_spec <- boost_tree(trees = tune(), tree_depth = tune(), min_n = tune(), loss_reduction = tune(), ## model complexity
+                       mtry = tune(), ## randomness
+                       learn_rate = tune() ## step size
                        ) %>%
         set_engine("lightgbm") %>% 
-        set_mode("regression")
-
+        set_mode("classification")
 
 lgbm_wf <- workflow() %>% 
         add_recipe(model_rec) %>%
         add_model(lgbm_spec)
 
 lgbm_params <- parameters(
-  trees(c(200, 700)), learn_rate(),
+  trees(c(300, 700)), learn_rate(),
   tree_depth(), min_n(), 
   loss_reduction(),
-  sample_size = sample_prop()
+ finalize(mtry(), train_data)  
 )
 ```
 
@@ -611,28 +603,29 @@ rf_spec <- rand_forest(trees = tune(), min_n = tune(), ## model complexity
                        mtry = tune(), ## randomness
                        ) %>%
         set_engine("ranger") %>% 
-        set_mode("regression")
+        set_mode("classification")
 
 rf_wf <- workflow() %>% 
         add_recipe(model_rec) %>%
         add_model(rf_spec)
 
 rf_params <- parameters(
-  trees(c(200, 700)), 
-  min_n(), 
+  trees(c(300, 700)), learn_rate(),
+  tree_depth(), min_n(), 
+  loss_reduction(),
  finalize(mtry(), train_data)  
 )
 ```
 
 ```{r}
 # logistic regression
-lr_spec <- linear_reg(penalty = tune(),
+lr_spec <- logistic_reg(penalty = tune(),
                         mixture = tune()) %>%
-  set_engine(engine = "glmnet") %>% 
-  set_mode("regression") 
+  set_engine(engine = "glm") %>% 
+  set_mode("classification") 
 
 lr_wf <- workflow() %>% 
-        add_recipe(model_rec_glm) %>%
+        add_recipe(model_rec) %>%
         add_model(lr_spec)
 
 lr_params <- parameters(penalty(),
@@ -645,7 +638,7 @@ knn_spec <- nearest_neighbor(neighbors = tune(),
                          weight_func = tune(),
                          dist_power = tune()) %>%
   set_engine("kknn") %>% 
-  set_mode("regression") 
+  set_mode("classification") 
 
 knn_wf <- workflow() %>% 
         add_recipe(model_rec) %>%
@@ -659,20 +652,23 @@ knn_params <- parameters(neighbors(),
 ```{r}
 # neural net
 nnet_spec <- mlp(hidden_units = tune(),
+                 penalty = tune(),
+                 dropout = tune(),
                  epochs = tune(),
-                        dropout = tune(), 
-                        learn_rate = tune()) %>% 
-  set_engine("brulee") %>%
-  set_mode("regression") %>% 
-  translate()
+                 activation = tune(),
+                 learn_rate = tune()) %>% 
+  set_engine("keras", verbose = 0) %>%
+  set_mode("classification") 
 
 nnet_wf <- workflow() %>% 
         add_recipe(model_rec) %>%
         add_model(nnet_spec)
 
 nnet_params <- parameters(hidden_units(),
+                         penalty(),
                          dropout(),
                          epochs(),
+                         activation(),
                          learn_rate())
 ```
 
@@ -691,8 +687,10 @@ xgb_res <-
     resamples = train_folds,
     param_info = xgb_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
                             verbose = TRUE)
   )
@@ -700,7 +698,7 @@ xgb_res <-
 toc()
 
 unregister_dopar()
-doParallel::stopImplicitCluster()
+
 metrics_xgb <- collect_metrics(xgb_res)
 ```
 
@@ -721,8 +719,10 @@ lgbm_res <-
     resamples = train_folds,
     param_info = lgbm_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
                             verbose = TRUE)
   )
@@ -730,7 +730,6 @@ lgbm_res <-
 toc()
 
 unregister_dopar()
-doParallel::stopImplicitCluster()
 
 metrics_lgbm <- collect_metrics(lgbm_res)
 ```
@@ -752,16 +751,17 @@ rf_res <-
     resamples = train_folds,
     param_info = rf_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
-                            verbose = TRUE)
+                            verbose = FALSE)
   )
 
 toc()
 
 unregister_dopar()
-doParallel::stopImplicitCluster()
 
 metrics_rf <- collect_metrics(rf_res)
 ```
@@ -783,16 +783,17 @@ lr_res <-
     resamples = train_folds,
     param_info = lr_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
-                            verbose = TRUE)
+                            verbose = FALSE)
   )
 
 toc()
 
 unregister_dopar()
-doParallel::stopImplicitCluster()
 
 metrics_lr <- collect_metrics(lr_res)
 ```
@@ -814,16 +815,17 @@ knn_res <-
     resamples = train_folds,
     param_info = knn_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
-                            verbose = TRUE)
+                            verbose = FALSE)
   )
 
 toc()
 
 unregister_dopar()
-doParallel::stopImplicitCluster()
 
 metrics_knn <- collect_metrics(knn_res)
 ```
@@ -845,10 +847,12 @@ nnet_res <-
     resamples = train_folds,
     param_info = nnet_params,
     iter = 100, 
-    metrics = metric_set(rmse),
-    control = control_bayes(no_improve = 30, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, roc_auc),
+    control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
-                            verbose = TRUE)
+                            verbose = FALSE)
   )
 
 toc()
@@ -861,12 +865,11 @@ metrics_nnet <- collect_metrics(nnet_res)
 ```{r}
 autoplot(xgb_res)
 ```
-
 #### Best results
 
 ```{r}
 best_results_xgb <- 
-        select_best(xgb_res, metric = "rmse") # change to different metrics
+        select_best(xgb_res, metric = "roc_auc") # change to different metrics
 ```
 
 ### Test models
@@ -881,19 +884,13 @@ final_xgb_fit     <- fit(final_workflow, data = train_data)
 pred <- predict(final_xgb_fit, test_data) %>% 
   bind_cols(test_data)
 
+conf_mat(pred, pred$score, pred$.pred_class)
+unique(pred$score)
 ```
-
 ```{r}
-# Predict on test data
-
-final_model <- finalize_model(nnet_spec, best_results_xgb)
-final_workflow    <- nnet_wf %>% update_model(final_model)
-final_lgbm_fit     <- fit(nnet_wf, data = train_data)
-
-pred <- predict(final_xgb_fit, test_data) %>% 
-  bind_cols(test_data)
-
+unique(pred$.pred_class)
 ```
+
 
 ```{r}
 # Prediction results
