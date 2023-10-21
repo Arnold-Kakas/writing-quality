@@ -16,7 +16,7 @@ output: html_document
 pacman::p_load(tidyverse,
                tidymodels,
                bonsai, # lightgbm
-               keras, # neural network
+               # neural network
                rlang,
                corrplot,
                janitor,
@@ -692,6 +692,7 @@ xgb_res <-
       accuracy, roc_auc),
     control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
+                            save_workflow = TRUE,
                             verbose = TRUE)
   )
 
@@ -724,6 +725,7 @@ lgbm_res <-
       accuracy, roc_auc),
     control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
+                            save_workflow = TRUE,
                             verbose = TRUE)
   )
 
@@ -756,6 +758,7 @@ rf_res <-
       accuracy, roc_auc),
     control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
+                            save_workflow = TRUE,
                             verbose = FALSE)
   )
 
@@ -788,6 +791,7 @@ lr_res <-
       accuracy, roc_auc),
     control = control_bayes(no_improve = 15, 
                             save_pred = TRUE,
+                            save_workflow = TRUE,
                             verbose = FALSE)
   )
 

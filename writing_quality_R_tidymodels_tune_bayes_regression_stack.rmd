@@ -1,0 +1,1469 @@
+---
+title: ''
+author: "Arnold Kakas"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, eval=TRUE}
+knitr::opts_chunk$set(
+  message = TRUE,
+  warning = FALSE
+)
+```
+
+<https://www.kaggle.com/code/mcpenguin/writing-processes-to-quality-baseline> 
+<br><https://www.kaggle.com/code/pehahn/xgb-base-in-r> 
+<br><https://juliasilge.com/blog/xgboost-tune-volleyball/>
+<br><https://www.kirenz.com/post/2021-02-17-r-classification-tidymodels/#specify-models>
+<br><https://www.youtube.com/watch?v=44rINyxp220>
+<br><https://www.analyticsvidhya.com/blog/2021/08/ensemble-stacking-for-machine-learning-and-deep-learning/>
+
+## Load packages and data
+
+```{r}
+pacman::p_load(
+  tidyverse,
+  tidymodels,
+  bonsai, # lightgbm
+  brulee,
+  keras, # neural network
+  rlang,
+  corrplot,
+  janitor,
+  patchwork, # plot alignment
+  ggplot2, # plots
+  # ggpubr, # regline equation
+  ggpmisc, # regline equation + R squared value in plots
+  vip,
+  doParallel,
+  tictoc
+)
+```
+
+```{r}
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list = ls(name = env), pos = env)
+}
+```
+
+```{r}
+# train_scores <- read_csv('../input/linking-writing-processes-to-writing-quality/train_scores.csv', show_col_types = FALSE)
+# test_logs <- read_csv('../input/linking-writing-processes-to-writing-quality/test_logs.csv', show_col_types = FALSE)
+# train_logs <- read_csv('../input/linking-writing-processes-to-writing-quality/train_logs.csv', show_col_types = FALSE)
+# sample_submission <- read_csv('../input/linking-writing-processes-to-writing-quality/sample_submission.csv', show_col_types = FALSE)
+
+train_scores <- read_csv("train_scores.csv", show_col_types = FALSE)
+train_logs <- read_csv("train_logs.csv", show_col_types = FALSE)
+test_logs <- read_csv("test_logs.csv", show_col_types = FALSE)
+sample_submission <- read_csv("sample_submission.csv", show_col_types = FALSE)
+```
+
+## Feature engineering
+
+### Functions
+
+```{r}
+# lists
+pause_threshold <- 2000
+burst_threshold <- 1000
+activities <- c("Input", "Remove/Cut", "Nonproduction", "Replace", "Paste")
+events <- c(
+  "q", "Space", "Backspace", "Shift", "ArrowRight", "Leftclick", "ArrowLeft", ".", ",",
+  "ArrowDown", "ArrowUp", "Enter", "CapsLock", "'", "Delete", "Unidentified"
+)
+text_changes <- c("q", "NoChange", "\n")
+punctuation <- c('\\"', "\\.", "\\,", "\\'", "\\-", "\\;", "\\:", "\\?", "\\!", "\\<", "\\>", "\\/", "\\#", "\\$", "\\%", "\\^", "\\&", "\\*", "\\(", "\\)", "\\_", "\\+")
+lags <- c(25, 50, 100)
+lag_cols <- c("action_time_gap25", "action_time_gap50", "action_time_gap100")
+
+# Function to calculate activity counts
+activity_counts <- function(df) {
+  tmp_df <- df %>%
+    filter(activity %in% activities) %>%
+    group_by(id) %>%
+    summarise(activity = list(activity)) %>%
+    unnest(activity) %>%
+    count(id, activity) %>%
+    complete(id, activity = activities, fill = list(n = 0)) %>%
+    spread(activity, n, fill = 0) %>%
+    rename_with(~ paste0("activity_", .), -id)
+
+  return(tmp_df)
+}
+
+# Function to calculate event counts
+event_counts <- function(df) {
+  tmp_df <- df %>%
+    filter(down_event %in% events) %>%
+    group_by(id) %>%
+    summarise(down_event = list(down_event)) %>%
+    unnest(down_event) %>%
+    count(id, down_event) %>%
+    complete(id, down_event = events, fill = list(n = 0)) %>%
+    spread(down_event, n, fill = 0) %>%
+    rename_with(~ paste0("event_", .), -id)
+
+  return(tmp_df)
+}
+
+# Function to calculate text change counts
+text_change_counts <- function(df) {
+  tmp_df <- df %>%
+    filter(text_change %in% text_changes) %>%
+    group_by(id) %>%
+    summarise(text_change = list(text_change)) %>%
+    unnest(text_change) %>%
+    count(id, text_change) %>%
+    complete(id, text_change = text_changes, fill = list(n = 0)) %>%
+    spread(text_change, n, fill = 0) %>%
+    rename_with(~ paste0("text_change_", .), -id)
+
+  return(tmp_df)
+}
+
+# Function to get input words
+# Function to get input words
+input_words <- function(df) {
+  tmp_df <- df %>%
+    filter(!str_detect(text_change, "=>"), text_change != "NoChange") %>%
+    group_by(id) %>%
+    summarise(text_change = list(text_change)) %>%
+    mutate(text_change = map_chr(text_change, ~ paste(.x, collapse = ""))) %>%
+    mutate(
+      input_word_count = map_int(text_change, ~ sum(str_count(.x, "q+")))
+    ) %>%
+    mutate(
+      input_word_length_mean = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~ str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(mean(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_geometric_mean = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~ str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(exp(mean(log(word_lengths))))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_iqr = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~ str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(IQR(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    ) %>%
+    mutate(
+      input_word_length_sd = sapply(text_change, function(x) {
+        if (length(x) > 0) {
+          word_lengths <- unlist(map(punctuation, ~ str_count(x, .x)))
+          # Filter word_lengths greater than 0
+          word_lengths <- word_lengths[word_lengths > 0]
+          if (length(word_lengths) > 0) {
+            return(sd(word_lengths))
+          } else {
+            return(0)
+          }
+        } else {
+          return(0)
+        }
+      })
+    )
+
+
+
+  tmp_df <- tmp_df %>%
+    select(-text_change)
+  return(tmp_df)
+
+  return(tmp_df)
+}
+
+
+
+
+# Function to make time lags
+time_lags <- function(df, lags) {
+  # Initialize features dataframe
+  unique_ids <- unique(df$id)
+  feats <- data.frame(id = unique_ids)
+
+  # Engineering time data
+  for (gap in lags) {
+    # cat(paste("> for gap", gap, "\n"))
+    df[paste("up_time_shift", gap, sep = "")] <- ave(df$up_time, df$id, FUN = function(x) c(rep(NA, gap), head(x, -gap)))
+    df[paste("action_time_gap", gap, sep = "")] <- df$down_time - df[paste("up_time_shift", gap, sep = "")]
+  }
+  df <- df[, -grep("up_time_shift", names(df))]
+  return(df)
+}
+```
+
+### Features
+
+
+```{r}
+train_logs_adj <- time_lags(train_logs, lags)
+
+Missing <- setdiff(lag_cols, names(train_logs_adj)) # Find names of missing columns (mostly due to test data)
+train_logs_adj[Missing] <- 0 # Add them, filled with '0's (mostly due to test data)
+
+
+
+train_logs_1 <- activity_counts(train_logs)
+train_logs_2 <- event_counts(train_logs)
+train_logs_3 <- text_change_counts(train_logs)
+train_logs_4 <- input_words(train_logs)
+
+train_logs_adj <- train_logs_adj %>%
+  group_by(id) %>%
+  mutate(
+    IKI = down_time - lag(down_time, default = 1),
+    action_time_std = sd(action_time, na.rm = TRUE),
+    pause = if_else(IKI >= pause_threshold, 1, 0),
+    is_char = ifelse(text_change != "NoChange", str_length(text_change), 0),
+    is_char = ifelse(is.na(is_char), 1, is_char),
+    p = if_else(IKI <= burst_threshold & activity != "Nonproduction", 1, 0),
+    p_burst = cumsum(p) + 1
+  ) %>%
+  ungroup() %>%
+  group_by(p_burst) %>%
+  mutate(p_burst_length = sum(activity == "Input")) %>%
+  ungroup() %>%
+  left_join(train_logs_1,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(train_logs_2,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(train_logs_3,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(train_logs_4,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 1)), # due to lag columns
+    IKI = if_else(IKI <= 0, 1, IKI),
+    action_time_gap25 = if_else(action_time_gap25 <= 0, 1, action_time_gap25),
+    action_time_gap50 = if_else(action_time_gap50 <= 0, 1, action_time_gap50),
+    action_time_gap100 = if_else(action_time_gap100 <= 0, 1, action_time_gap100)
+  )
+
+
+train_df <- train_logs_adj %>%
+  group_by(id) %>%
+  summarize(
+    last_pos = max(cursor_position),
+    total_events = max(event_id),
+    word_count = max(word_count),
+    net_time = round(sum(action_time) / 1000, 0),
+    time = round(max(up_time) / 1000, 0),
+    first_time = round(min(down_time) / 1000, 0),
+    pauses = sum(pause),
+    pauses_share = round(pauses / time, 3),
+    IKI_geometric_mean = exp(mean(log(IKI))),
+    IKI_IQR = IQR(IKI, na.rm = TRUE),
+    IKI_max = max(IKI, na.rm = TRUE),
+    typing_speed = round(word_count / time, 3),
+    p_burst = n_distinct(p_burst),
+    p_burst_per_min = round(p_burst / (net_time / 60), 0),
+    p_burst_length = round(mean(p_burst_length), 0),
+    action_time_gap25_mean = mean(action_time_gap25, na.rm = TRUE),
+    action_time_gap25_geometric_mean = exp(mean(log(action_time_gap25))),
+    action_time_gap25_max = max(action_time_gap25, na.rm = TRUE),
+    action_time_gap50_mean = mean(action_time_gap50, na.rm = TRUE),
+    action_time_gap50_geometric_mean = exp(mean(log(action_time_gap50))),
+    action_time_gap50_max = max(action_time_gap50, na.rm = TRUE),
+    action_time_gap100_max = max(action_time_gap100, na.rm = TRUE),
+    action_time_gap100_mean = mean(action_time_gap100, na.rm = TRUE),
+    action_time_gap100_geometric_mean = exp(mean(log(action_time_gap100))),
+    activity_Input = mean(activity_Input, na.rm = TRUE),
+    activity_Nonproduction = mean(activity_Nonproduction, na.rm = TRUE),
+    activity_Paste = mean(activity_Paste, na.rm = TRUE),
+    `activity_Remove/Cut` = mean(`activity_Remove/Cut`, na.rm = TRUE),
+    activity_Replace = mean(activity_Replace, na.rm = TRUE),
+    `event_'` = mean(`event_'`, na.rm = TRUE),
+    `event_,` = mean(`event_,`, na.rm = TRUE),
+    event_. = mean(event_., na.rm = TRUE),
+    event_ArrowDown = mean(event_ArrowDown, na.rm = TRUE),
+    event_ArrowLeft = mean(event_ArrowLeft, na.rm = TRUE),
+    event_ArrowRight = mean(event_ArrowRight, na.rm = TRUE),
+    event_ArrowUp = mean(event_ArrowUp, na.rm = TRUE),
+    event_Backspace = mean(event_Backspace, na.rm = TRUE),
+    event_CapsLock = mean(event_CapsLock, na.rm = TRUE),
+    event_Delete = mean(event_Delete, na.rm = TRUE),
+    event_Enter = mean(event_Enter, na.rm = TRUE),
+    event_Leftclick = mean(event_Leftclick, na.rm = TRUE),
+    event_q = mean(event_q, na.rm = TRUE),
+    event_Shift = mean(event_Shift, na.rm = TRUE),
+    event_Space = mean(event_Space, na.rm = TRUE),
+    event_Unidentified = mean(event_Unidentified, na.rm = TRUE),
+    `text_change_\n` = mean(`text_change_
+`, na.rm = TRUE),
+    text_change_NoChange = mean(text_change_NoChange, na.rm = TRUE),
+    text_change_q = mean(text_change_q, na.rm = TRUE),
+    input_word_count = mean(input_word_count, na.rm = TRUE),
+    input_word_length_mean = mean(input_word_length_mean, na.rm = TRUE),
+    input_word_length_geometric_mean = mean(input_word_length_geometric_mean, na.rm = TRUE),
+    accuracy = round((activity_Input - activity_Replace - `activity_Remove/Cut`) / activity_Input, 3),
+    words_per_sec = input_word_count / time,
+    words_per_event = input_word_count / total_events,
+    events_per_sec = total_events / time
+  ) %>%
+  left_join(train_scores,
+    join_by(id),
+    keep = FALSE
+  ) %>% 
+  mutate(
+score_factor = factor(score)
+  )
+```
+
+
+## EDA
+
+### Summary of train dataframe
+
+```{r}
+summary(train_df)
+```
+
+### Distributions
+
+```{r}
+# score frequencies
+train_df %>% 
+  ggplot(aes(x = score_factor)) +
+  geom_histogram(stat = "count") +
+  theme_minimal()
+
+train_df %>% 
+  group_by(score_factor) %>% 
+  summarize(count = n())
+```
+
+I will filter out scores 0.5, 1 and 6 due to very low frequency and use step_downsample with under_ratio 5.8 to bring the majority levels down to about 400 each (400/69 - frequency of score 1.5).
+
+```{r}
+dist_train_df <- train_df %>%
+  pivot_longer(
+    cols = -id,
+    names_to = "measure",
+    values_to = "measurement"
+  )
+
+dist_measures <- unique(dist_train_df$measure)
+
+for (i in dist_measures) {
+  p <- ggplot(dist_train_df %>% filter(measure == i), aes(x = measurement)) +
+    geom_boxplot() +
+    labs(x = i)
+
+  print(p)
+}
+```
+
+
+### Scatterplots of score with other features
+```{r message=FALSE, warning=FALSE}
+point_train_df <- train_df %>%
+  pivot_longer(
+    cols = -c(id, score),
+    names_to = "measure"
+  )
+
+point_measures <- unique(point_train_df$measure)
+
+for (i in point_measures) {
+  p <- ggplot(point_train_df %>% filter(measure == i), aes(x = score, y = value)) +
+    geom_point() +
+    geom_smooth(method = lm, formula = y ~ x) + # add linear trend line
+    stat_poly_eq(
+      formula = y ~ x,
+      aes(label = paste(..eq.label.., ..rr.label.., ..p.value.label.., sep = "*`,`~")),
+      parse = TRUE,
+      label.x.npc = "right",
+      vstep = 0.05
+    ) + # sets vertical spacing +
+    labs(
+      y = i,
+      x = "points"
+    )
+
+  print(p)
+}
+```
+
+### Select and adjust features based on EDA
+
+```{r}
+train_df_reduced <- train_df %>%
+  select(-c(
+    accuracy,
+    input_word_length_geometric_mean,
+    pauses_share,
+    activity_Paste,
+    event_Unidentified,
+    event_ArrowUp,
+    event_Delete,
+    event_Enter,
+    event_Leftclick
+  ))
+```
+
+```{r}
+# Function to remove outliers
+remove_outliers <- function(df) {
+  # Get a list of column names where we need to eliminate outliers, based on distributions
+  cols_to_check <- c(
+    "first_time",
+    "IKI_max",
+    "event_ArrowDown",
+    "event_ArrowLeft",
+    "event_ArrowRight",
+    "event_CapsLock",
+    "words_per_sec"
+  )
+
+  # Calculate outlier margins for each column
+  margins <- lapply(cols_to_check, function(col) {
+    col_mean <- mean(df[[col]], na.rm = TRUE)
+    col_iqr <- IQR(df[[col]], na.rm = TRUE)
+    # lower_margin <- col_mean - 1.5 * col_iqr
+    upper_margin <- col_mean + 1.5 * col_iqr
+
+    return(list(column = col, upper_margin = upper_margin)) # lower_margin = lower_margin,
+  })
+
+  # Select and apply filtering conditions for the first n elements in 'margins' list
+  n <- length(margins) # Use the length of selected_margins
+
+  # Filter the DataFrame based on the selected margins using rlang
+  filtered_df <- df
+  for (i in 1:n) {
+    col <- margins[[i]]$column
+    # lower_margin <- margins[[i]]$lower_margin
+    upper_margin <- margins[[i]]$upper_margin
+
+    # Use rlang to reference columns dynamically
+    filtered_df <- filtered_df %>%
+      filter(!!sym(col) <= upper_margin) # !!sym(col) >= lower_margin,
+  }
+
+  return(filtered_df)
+}
+```
+
+```{r}
+# Call the function to filter your 'train_df' dataframe
+filtered_train_df <- remove_outliers(train_df_reduced)
+```
+
+### Distribution after changes 1
+
+```{r}
+dist_train_df_2 <- filtered_train_df %>%
+  pivot_longer(
+    cols = -id,
+    names_to = "measure",
+    values_to = "measurement"
+  )
+
+dist_measures <- unique(dist_train_df_2$measure)
+
+for (i in dist_measures) {
+  p <- ggplot(dist_train_df_2 %>% filter(measure == i), aes(x = measurement)) +
+    geom_boxplot() +
+    labs(x = i)
+
+  print(p)
+}
+```
+
+
+### Scatterplots after changes 1
+
+```{r message=FALSE, warning=FALSE}
+point_train_df_2 <- filtered_train_df %>%
+  pivot_longer(
+    cols = -c(id, score),
+    names_to = "measure"
+  )
+
+point_measures <- unique(point_train_df_2$measure)
+
+for (i in point_measures) {
+  p <- ggplot(point_train_df_2 %>% filter(measure == i), aes(x = score, y = value)) +
+    geom_point() +
+    geom_smooth(method = lm, formula = y ~ x) + # add linear trend line
+    stat_poly_eq(
+      formula = y ~ x,
+      aes(label = paste(..eq.label.., ..rr.label.., ..p.value.label.., sep = "*`,`~")),
+      parse = TRUE,
+      label.x.npc = "right",
+      vstep = 0.05
+    ) + # sets vertical spacing +
+    labs(
+      y = i,
+      x = "points"
+    )
+
+  print(p)
+}
+```
+
+### Select features 2
+```{r}
+train_df_reduced_2 <- filtered_train_df %>%
+  select(-c(
+    time,
+    event_ArrowDown,
+    event_ArrowLeft,
+    event_ArrowRight,
+    event_CapsLock,
+    `text_change_
+`,
+    p_burst_per_min
+  ))
+```
+
+### Correlations
+
+There are (unsurprisingly) some highly correlated variables
+
+```{r}
+train_corr_2 <- train_df_reduced_2 %>%
+  select(-id) %>%
+  cor()
+corrplot(train_corr_2)
+```
+
+```{r}
+train_df_reduced_2 <- train_df_reduced_2 %>% clean_names()
+```
+
+
+## Models preparation
+
+### Specifications
+
+```{r}
+# Split data
+
+set.seed(123)
+train_split <- initial_split(train_df_reduced_2 %>% select(-id), prop = 0.7, strata = score)
+train_data <- training(train_split)
+test_data <- testing(train_split)
+
+train_folds <- vfold_cv(train_data, v = 7)
+```
+
+```{r}
+# Recipe
+model_rec <- recipe(score ~ ., data = train_data) %>%
+  step_downsample(score_factor, under_ratio = 5.8) %>% 
+  step_rm(score_factor) %>% 
+  step_zv(all_predictors()) %>%
+  # step_corr(all_predictors(), threshold = 0.9) %>% # removing correlated features as redundant
+  # step_lincomb(all_predictors()) %>%
+  step_normalize(all_predictors()) %>%
+  step_center(all_predictors())
+
+model_rec_glm <- recipe(score ~ ., data = train_data) %>%
+  step_downsample(score_factor, under_ratio = 5.8) %>% 
+  step_rm(score_factor) %>% 
+  step_zv(all_predictors()) %>%
+  step_corr(all_predictors(), threshold = 0.9) %>% # removing correlated features as redundant
+  #step_lincomb(all_predictors()) %>%
+  step_normalize(all_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_pca()
+```
+
+
+
+```{r}
+# xgboost
+xgb_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(), loss_reduction = tune(), ## model complexity
+  sample_size = tune(), mtry = tune(), ## randomness
+  learn_rate = tune() ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(xgb_spec)
+
+xgb_params <- parameters(
+  trees(c(200, 700)), learn_rate(),
+  tree_depth(), min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(), finalize(mtry(), train_data)
+)
+```
+
+```{r}
+# lightgbm
+lgbm_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), learn_rate = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("lightgbm") %>%
+  set_mode("regression")
+
+
+lgbm_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(lgbm_spec)
+
+lgbm_params <- parameters(
+  trees(c(200, 700)), learn_rate(),
+  tree_depth(), min_n(),
+  loss_reduction(),
+  sample_size = sample_prop()
+)
+```
+
+```{r}
+# random forest
+rf_spec <- rand_forest(
+  trees = tune(), min_n = tune(), ## model complexity
+  mtry = tune(), ## randomness
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(rf_spec)
+
+rf_params <- parameters(
+  trees(c(200, 700)),
+  min_n(),
+  finalize(mtry(), train_data)
+)
+```
+
+```{r}
+# logistic regression
+lr_spec <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine(engine = "glmnet") %>%
+  set_mode("regression")
+
+lr_wf <- workflow() %>%
+  add_recipe(model_rec_glm) %>%
+  add_model(lr_spec)
+
+lr_params <- parameters(
+  penalty(),
+  mixture()
+)
+```
+
+```{r}
+# knn
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  weight_func = tune(),
+  dist_power = tune()
+) %>%
+  set_engine("kknn") %>%
+  set_mode("regression")
+
+knn_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(knn_spec)
+
+knn_params <- parameters(
+  neighbors(),
+  weight_func(),
+  dist_power()
+)
+```
+
+```{r}
+# neural net
+nnet_spec <- mlp(
+  hidden_units = tune(),
+  epochs = tune(),
+  dropout = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("brulee") %>%
+  set_mode("regression") %>%
+  translate()
+
+nnet_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(nnet_spec)
+
+nnet_params <- parameters(
+  hidden_units(),
+  dropout(),
+  epochs(),
+  learn_rate()
+)
+```
+
+### Tune models with tune_bayes
+
+```{r}
+# xgboost
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+xgb_res <-
+  tune_bayes(
+    xgb_wf,
+    resamples = train_folds,
+    param_info = xgb_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_xgb <- select_best(xgb_res, metric = "rmse")
+metrics_xgb <- collect_metrics(xgb_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+```{r}
+# lightgbm
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+lgbm_res <-
+  tune_bayes(
+    lgbm_wf,
+    resamples = train_folds,
+    param_info = lgbm_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_lgbm <- select_best(lgbm_res, metric = "rmse")
+metrics_lgbm <- collect_metrics(lgbm_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+```{r}
+# random forest
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+rf_res <-
+  tune_bayes(
+    rf_wf,
+    resamples = train_folds,
+    param_info = rf_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_rf <- select_best(rf_res, metric = "rmse")
+metrics_rf <- collect_metrics(rf_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+```{r}
+# logistic regression
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+lr_res <-
+  tune_bayes(
+    lr_wf,
+    resamples = train_folds,
+    param_info = lr_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_lr <- select_best(lr_res, metric = "rmse")
+metrics_lr <- collect_metrics(lr_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+```{r}
+# knn
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+knn_res <-
+  tune_bayes(
+    knn_wf,
+    resamples = train_folds,
+    param_info = knn_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_knn <- select_best(knn_res, metric = "rmse")
+metrics_knn <- collect_metrics(knn_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+```{r}
+# neural net
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+nnet_res <-
+  tune_bayes(
+    nnet_wf,
+    resamples = train_folds,
+    param_info = nnet_params,
+    iter = 25,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+
+best_results_nnet <- select_best(nnet_res, metric = "rmse")
+metrics_nnet <- collect_metrics(nnet_res)
+```
+
+```{r}
+autoplot(xgb_res)
+```
+
+### Test models
+
+
+```{r}
+# Predict on test data
+
+xgb_best_model <- finalize_model(xgb_spec, best_results_xgb)
+xgb_best_workflow <- xgb_wf %>% update_model(xgb_best_model)
+xgb_best_fit <- fit(xgb_best_workflow, data = train_data)
+
+xgb_pred <- predict(xgb_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+xgb_g1 <-
+  xgb_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+xgb_g2 <-
+  xgb_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+xgb_g1 / xgb_g2
+```
+
+```{r}
+# Predict on test data
+
+lgbm_best_model <- finalize_model(lgbm_spec, best_results_lgbm)
+lgbm_best_workflow <- lgbm_wf %>% update_model(lgbm_best_model)
+lgbm_best_fit <- fit(lgbm_best_workflow, data = train_data)
+
+lgbm_pred <- predict(lgbm_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+lgbm_g1 <-
+  lgbm_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+lgbm_g2 <-
+  lgbm_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+lgbm_g1 / lgbm_g2
+```
+
+
+```{r}
+# Predict on test data
+
+rf_best_model <- finalize_model(rf_spec, best_results_rf)
+rf_best_workflow <- rf_wf %>% update_model(rf_best_model)
+rf_best_fit <- fit(rf_best_workflow, data = train_data)
+
+rf_pred <- predict(rf_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+rf_g1 <-
+  rf_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+rf_g2 <-
+  rf_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+rf_g1 / rf_g2
+```
+
+```{r}
+# Predict on test data
+
+lr_best_model <- finalize_model(lr_spec, best_results_lr)
+lr_best_workflow <- lr_wf %>% update_model(lr_best_model)
+lr_best_fit <- fit(lr_best_workflow, data = train_data)
+
+lr_pred <- predict(lr_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+lr_g1 <-
+  lr_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+lr_g2 <-
+  lr_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+lr_g1 / lr_g2
+```
+
+```{r}
+# Predict on test data
+
+knn_best_model <- finalize_model(knn_spec, best_results_knn)
+knn_best_workflow <- knn_wf %>% update_model(knn_best_model)
+knn_best_fit <- fit(knn_best_workflow, data = train_data)
+
+knn_pred <- predict(knn_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+knn_g1 <-
+  knn_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+knn_g2 <-
+  knn_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+knn_g1 / knn_g2
+```
+
+```{r}
+# Predict on test data
+
+nnet_best_model <- finalize_model(nnet_spec, best_results_nnet)
+nnet_best_workflow <- nnet_wf %>% update_model(nnet_best_model)
+nnet_best_fit <- fit(nnet_best_workflow, data = train_data)
+
+nnet_pred <- predict(nnet_best_fit, test_data) %>%
+  bind_cols(test_data)
+```
+
+
+```{r}
+# Prediction results
+nnet_g1 <-
+  nnet_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+nnet_g2 <-
+  nnet_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+nnet_g1 / nnet_g2
+```
+
+As we can see, all models face the same problem: overestimating scores in range from 3.5 to 4.5 and underestimating higher scores.
+
+## Stack models and Creating Meta Learner
+
+### Collect final parameters
+
+```{r}
+xgb_rmse <- metrics_xgb %>% inner_join(select_best(xgb_res, metric = "rmse")) %>% select(xgb = mean)
+lgbm_rmse <- metrics_lgbm %>% inner_join(select_best(lgbm_res, metric = "rmse")) %>% select(lgbm = mean)
+rf_rmse <- metrics_rf %>% inner_join(select_best(rf_res, metric = "rmse") ) %>% select(rf = mean)
+lr_rmse <- metrics_lr %>% inner_join(select_best(lr_res, metric = "rmse")) %>% select(lr = mean)
+knn_rmse <- metrics_knn %>% inner_join(select_best(knn_res, metric = "rmse")) %>% select(knn = mean)
+nnet_rmse <- metrics_knn %>% inner_join(select_best(nnet_res, metric = "rmse")) %>% select(nnet = mean)
+
+models_rmse <- cbind(xgb_rmse, lgbm_rmse, rf_rmse, lr_rmse, knn_rmse, nnet_rmse)
+
+best_final_param_xgb <-
+  select_best(xgb_res, metric = "rmse") %>%
+  select(trees:mtry)
+
+best_final_param_lgbm <-
+  select_best(lgbm_res, metric = "rmse") %>%
+  select(trees:sample_size)
+
+best_final_param_rf <-
+  select_best(rf_res, metric = "rmse") %>%
+  select(trees:mtry)
+
+best_final_param_lr <-
+  select_best(lr_res, metric = "rmse") %>%
+  select(penalty:mixture)
+
+best_final_param_knn <-
+  select_best(knn_res, metric = "rmse") %>%
+  select(neighbors:dist_power)
+
+best_final_param_nnet <-
+  select_best(nnet_res, metric = "rmse") %>%
+  select(hidden_units:learn_rate)
+```
+
+### Prepare stack dataframe
+
+```{r message=FALSE, warning=FALSE}
+xgb_stack <- xgb_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_xgb, keep = FALSE) %>%
+  select(id, .row, score, xgb = .pred)
+
+lgbm_stack <- lgbm_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_lgbm, keep = FALSE) %>%
+  select(id, .row, lgbm = .pred)
+
+rf_stack <- rf_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_rf, keep = FALSE) %>%
+  select(id, .row, rf = .pred)
+
+lr_stack <- lr_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_lr, keep = FALSE) %>%
+  select(id, .row, lr = .pred)
+
+knn_stack <- knn_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_knn, keep = FALSE) %>%
+  select(id, .row, knn = .pred)
+
+nnet_stack <- nnet_res %>%
+  collect_predictions() %>%
+  inner_join(best_final_param_nnet, keep = FALSE) %>%
+  select(id, .row, nnet = .pred)
+
+stack_data <- xgb_stack %>%
+  left_join(lgbm_stack) %>%
+  left_join(rf_stack) %>%
+  left_join(lr_stack) %>%
+  left_join(knn_stack) %>%
+  left_join(nnet_stack) %>% 
+  select(-.row, -id)
+```
+
+### Meta Learners preparation
+
+```{r}
+# split data
+
+set.seed(123)
+stack_train_split <- initial_split(stack_data, prop = 0.7, strata = score)
+stack_train_data <- training(stack_train_split)
+stack_test_data <- testing(stack_train_split)
+
+stack_train_folds <- vfold_cv(stack_train_data, v = 5)
+```
+
+```{r message=FALSE, warning=FALSE}
+# define a recipe for modeling
+stack_model_recipe <- recipe(score ~ ., data = stack_train_data)
+
+# meta learners workflows
+meta_xgb_wf <- workflow() %>%
+  add_recipe(stack_model_recipe) %>%
+  add_model(xgb_spec)
+
+meta_lgbm_wf <- workflow() %>%
+  add_recipe(stack_model_recipe) %>%
+  add_model(lgbm_spec)
+
+meta_rf_wf <- workflow() %>%
+  add_recipe(stack_model_recipe) %>%
+  add_model(rf_spec)
+
+meta_lr_wf <- workflow() %>%
+  add_recipe(stack_model_recipe) %>%
+  add_model(lr_spec)
+
+meta_knn_wf <- workflow() %>%
+  add_recipe(stack_model_recipe) %>%
+  add_model(knn_spec)
+
+```
+
+### Tune Meta Learners with tune_bayes
+
+```{r message=FALSE, warning=FALSE}
+# xgboost
+registerDoParallel(detectCores() - 1)
+
+tic()
+set.seed(123)
+
+meta_xgb_res <-
+  tune_bayes(
+    meta_xgb_wf,
+    resamples = stack_train_folds,
+    param_info = xgb_params,
+    iter = 30,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+meta_lgbm_res <-
+  tune_bayes(
+    meta_lgbm_wf,
+    resamples = stack_train_folds,
+    param_info = lgbm_params,
+    iter = 30,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+meta_rf_res <-
+  tune_bayes(
+    meta_rf_wf,
+    resamples = stack_train_folds,
+    param_info = rf_params,
+    iter = 30,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+meta_lr_res <-
+  tune_bayes(
+    meta_lr_wf,
+    resamples = stack_train_folds,
+    param_info = lr_params,
+    iter = 30,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+meta_knn_res <-
+  tune_bayes(
+    meta_knn_wf,
+    resamples = stack_train_folds,
+    param_info = knn_params,
+    iter = 30,
+    metrics = metric_set(rmse),
+    control = control_bayes(
+      no_improve = 15,
+      save_pred = TRUE,
+      save_workflow = TRUE,
+      verbose = TRUE
+    )
+  )
+
+toc()
+
+unregister_dopar()
+doParallel::stopImplicitCluster()
+
+best_results_meta_xgb <- select_best(meta_xgb_res, metric = "rmse")
+meta_metrics_xgb <- collect_metrics(meta_xgb_res)
+
+best_results_meta_lgbm <- select_best(meta_lgbm_res, metric = "rmse")
+meta_metrics_lgbm <- collect_metrics(meta_lgbm_res)
+
+best_results_meta_rf <- select_best(meta_rf_res, metric = "rmse")
+meta_metrics_rf <- collect_metrics(meta_rf_res)
+
+best_results_meta_lr <- select_best(meta_lr_res, metric = "rmse")
+meta_metrics_lr <- collect_metrics(meta_lr_res)
+
+best_results_meta_knn <- select_best(meta_knn_res, metric = "rmse")
+meta_metrics_knn <- collect_metrics(meta_knn_res)
+
+```
+
+
+```{r message=FALSE, warning=FALSE}
+meta_xgb_rmse <- meta_metrics_xgb %>% inner_join(best_results_meta_xgb) %>% select(xgb = mean)
+meta_lgbm_rmse <- meta_metrics_lgbm %>% inner_join(best_results_meta_lgbm) %>% select(lgbm = mean)
+meta_rf_rmse <- meta_metrics_rf %>% inner_join(best_results_meta_rf) %>% select(rf = mean)
+meta_lr_rmse <- meta_metrics_lr %>% inner_join(best_results_meta_lr) %>% select(lr = mean)
+meta_knn_rmse <- meta_metrics_knn %>% inner_join(best_results_meta_knn) %>% select(knn = mean)
+
+metas_rmse <- cbind(meta_xgb_rmse, meta_lgbm_rmse, meta_rf_rmse, meta_lr_rmse, meta_knn_rmse)
+```
+
+```{r}
+comparison <- models_rmse %>% bind_rows(metas_rmse)
+rownames(comparison) <- c("models", "meta learners")
+
+comparison
+```
+
+
+### Evaluate final Meta Learner
+
+
+After multiple tests the best result was consistently from lr model so we move forward with it. 
+```{r}
+meta_best_model <- finalize_model(lr_spec, best_results_meta_lr)
+meta_best_workflow <- meta_lr_wf %>% update_model(meta_best_model)
+meta_best_fit <- fit(meta_best_workflow, data = stack_train_data)
+
+meta_pred <- predict(meta_best_fit, stack_test_data) %>%
+  bind_cols(stack_test_data)
+```
+
+
+```{r}
+meta_g1 <-
+  meta_pred %>%
+  ggplot(aes(x = .pred, y = score)) +
+  geom_point() +
+  geom_abline(intercept = 0, col = "red")
+
+
+meta_g2 <-
+  meta_pred %>%
+  select(.pred, score) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = value, volor = key, fill = key)) +
+  geom_density(alpha = .2) +
+  labs(x = "", y = "")
+
+meta_g1 / meta_g2
+```
+
+
+## Predicting
+
+```{r}
+
+
+test_df <- test_df %>% mutate_if(is.numeric, function(x) ifelse(is.infinite(x), 0, x))
+test_df[is.na(test_df)] <- 0
+```
+
+```{r eval=FALSE, include=FALSE}
+pred_test <- predict(model_fit$.workflow[[1]], new_data = test_df)
+
+sample_submission$score <- pred_test$.pred
+write_csv(sample_submission, "submission.csv")
+```
+
+```{r}
+fitted_xgb <-
+  boosting_final$.workflow[[1]] %>%
+  fit(data = train_df)
+
+pred_test <- predict(fitted_xgb, new_data = test_df)
+
+sample_submission$score <- pred_test$.pred
+write_csv(sample_submission, "submission.csv")
+```
+
+
+
+
+https://johnbedwards.io/blog/stacks/ stacks
+https://stacks.tidymodels.org/index.html stacks
+https://stacks.tidymodels.org/reference/add_candidates.html stacks
+https://github.com/tidymodels/tune/issues/74 possible issue with keras
