@@ -24,7 +24,7 @@ knitr::opts_chunk$set(
 ```{r}
 pacman::p_load(
   tidyverse,
-  tidymodels,
+  themis, # step_downsample
   bonsai, # lightgbm
   brulee,
   keras, # neural network
@@ -37,7 +37,8 @@ pacman::p_load(
   ggpmisc, # regline equation + R squared value in plots
   vip,
   doParallel,
-  tictoc
+  tictoc,
+  tidymodels
 )
 ```
 
@@ -348,7 +349,7 @@ train_df <- train_logs_adj %>%
     keep = FALSE
   ) %>% 
   mutate(
-score_factor = factor(score)
+score_factor = as.character(score)
   )
 ```
 
@@ -375,7 +376,14 @@ train_df %>%
   summarize(count = n())
 ```
 
-I will filter out scores 0.5, 1 and 6 due to very low frequency and use step_downsample with under_ratio 5.8 to bring the majority levels down to about 400 each (400/69 - frequency of score 1.5).
+```{r}
+# keep score factor separatelly and join before model preparation
+score_factor_df <- train_df %>% select(id, score_factor)
+
+train_df <- train_df %>% select(-score_factor) %>% filter(score > 1 & score < 6)
+```
+
+I filtered out scores 0.5, 1 and 6 due to very low frequency and use step_downsample with under_ratio 5.8 to bring the majority levels down to about 400 each (400/69 - frequency of score 1.5).
 
 ```{r}
 dist_train_df <- train_df %>%
@@ -576,15 +584,40 @@ train_df_reduced_2 <- train_df_reduced_2 %>% clean_names()
 ```
 
 
+```{r eval=FALSE, include=FALSE}
+# scaling as all tidymodel step functions related to scaling and normalization returned NA or NaN
+# Function to scale numeric columns in a dataframe, excluding "id"
+scale_numeric_columns <- function(df) {
+  # Identify numeric columns except "id"
+  numeric_columns <- setdiff(names(df), c("id", "score"))
+  
+  # Scale numeric columns
+  df[, numeric_columns] <- scale(df[, numeric_columns])
+  
+  return(df)
+}
+
+
+scaled_train_df <- scale_numeric_columns(train_df_reduced_2)
+```
+
+
+
 ## Models preparation
 
 ### Specifications
 
 ```{r}
 # Split data
-
 set.seed(123)
-train_split <- initial_split(train_df_reduced_2 %>% select(-id), prop = 0.7, strata = score)
+final_train_df <- scaled_train_df %>%
+  left_join(score_factor_df, join_by(id), keep = FALSE) %>% 
+  select(-id) %>% 
+  mutate_at(1:40, as.numeric) %>% 
+  mutate(score_factor = factor(score_factor))
+  
+
+train_split <- initial_split(final_train_df, prop = 0.7, strata = score)
 train_data <- training(train_split)
 test_data <- testing(train_split)
 
@@ -595,24 +628,21 @@ train_folds <- vfold_cv(train_data, v = 7)
 # Recipe
 model_rec <- recipe(score ~ ., data = train_data) %>%
   step_downsample(score_factor, under_ratio = 5.8) %>% 
-  step_rm(score_factor) %>% 
-  step_zv(all_predictors()) %>%
-  # step_corr(all_predictors(), threshold = 0.9) %>% # removing correlated features as redundant
-  # step_lincomb(all_predictors()) %>%
-  step_normalize(all_predictors()) %>%
-  step_center(all_predictors())
+  step_rm(score_factor)
 
 model_rec_glm <- recipe(score ~ ., data = train_data) %>%
   step_downsample(score_factor, under_ratio = 5.8) %>% 
   step_rm(score_factor) %>% 
-  step_zv(all_predictors()) %>%
-  step_corr(all_predictors(), threshold = 0.9) %>% # removing correlated features as redundant
-  #step_lincomb(all_predictors()) %>%
-  step_normalize(all_predictors()) %>%
-  step_center(all_predictors()) %>%
-  step_pca()
+  step_naomit(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors())
 ```
 
+```{r eval=FALSE, include=FALSE}
+prep(model_rec_glm)
+
+bake(prep(model_rec_glm, retain = TRUE),new_data = NULL)
+
+```
 
 
 ```{r}
@@ -758,7 +788,7 @@ xgb_res <-
     xgb_wf,
     resamples = train_folds,
     param_info = xgb_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -793,7 +823,7 @@ lgbm_res <-
     lgbm_wf,
     resamples = train_folds,
     param_info = lgbm_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -828,7 +858,7 @@ rf_res <-
     rf_wf,
     resamples = train_folds,
     param_info = rf_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -863,7 +893,7 @@ lr_res <-
     lr_wf,
     resamples = train_folds,
     param_info = lr_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -898,7 +928,7 @@ knn_res <-
     knn_wf,
     resamples = train_folds,
     param_info = knn_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -933,7 +963,7 @@ nnet_res <-
     nnet_wf,
     resamples = train_folds,
     param_info = nnet_params,
-    iter = 25,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -1288,7 +1318,7 @@ meta_xgb_res <-
     meta_xgb_wf,
     resamples = stack_train_folds,
     param_info = xgb_params,
-    iter = 30,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
