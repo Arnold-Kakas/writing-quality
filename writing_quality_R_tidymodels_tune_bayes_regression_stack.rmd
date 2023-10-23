@@ -584,7 +584,7 @@ train_df_reduced_2 <- train_df_reduced_2 %>% clean_names()
 ```
 
 
-```{r eval=FALSE, include=FALSE}
+```{r}
 # scaling as all tidymodel step functions related to scaling and normalization returned NA or NaN
 # Function to scale numeric columns in a dataframe, excluding "id"
 scale_numeric_columns <- function(df) {
@@ -1491,9 +1491,3 @@ write_csv(sample_submission, "submission.csv")
 ```
 
 
-
-
-https://johnbedwards.io/blog/stacks/ stacks
-https://stacks.tidymodels.org/index.html stacks
-https://stacks.tidymodels.org/reference/add_candidates.html stacks
-https://github.com/tidymodels/tune/issues/74 possible issue with keras
