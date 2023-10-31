@@ -26,14 +26,12 @@ pacman::p_load(
   tidyverse,
   themis, # step_downsample
   bonsai, # lightgbm
-  brulee,
-  keras, # neural network
+  kknn, # knn engine
   rlang,
   corrplot,
   janitor,
   patchwork, # plot alignment
   ggplot2, # plots
-  # ggpubr, # regline equation
   ggpmisc, # regline equation + R squared value in plots
   vip,
   doParallel,
@@ -637,6 +635,15 @@ model_rec_glm <- recipe(score ~ ., data = train_data) %>%
   step_pca(all_numeric_predictors())
 ```
 
+```{r}
+# Recipe for predictions
+prediciton_model_rec <- recipe(score ~ ., data = train_data %>% select(-score_factor))
+
+prediciton_model_rec_glm <- recipe(score ~ ., data = train_data %>% select(-score_factor)) %>%
+  step_naomit(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors())
+```
+
 ```{r eval=FALSE, include=FALSE}
 prep(model_rec_glm)
 
@@ -750,29 +757,6 @@ knn_params <- parameters(
 )
 ```
 
-```{r}
-# neural net
-nnet_spec <- mlp(
-  hidden_units = tune(),
-  epochs = tune(),
-  dropout = tune(),
-  learn_rate = tune()
-) %>%
-  set_engine("brulee") %>%
-  set_mode("regression") %>%
-  translate()
-
-nnet_wf <- workflow() %>%
-  add_recipe(model_rec) %>%
-  add_model(nnet_spec)
-
-nnet_params <- parameters(
-  hidden_units(),
-  dropout(),
-  epochs(),
-  learn_rate()
-)
-```
 
 ### Tune models with tune_bayes
 
@@ -843,7 +827,7 @@ metrics_lgbm <- collect_metrics(lgbm_res)
 ```
 
 ```{r}
-autoplot(xgb_res)
+autoplot(lgbm_res)
 ```
 
 ```{r}
@@ -878,7 +862,7 @@ metrics_rf <- collect_metrics(rf_res)
 ```
 
 ```{r}
-autoplot(xgb_res)
+autoplot(rf_res)
 ```
 
 ```{r}
@@ -913,7 +897,7 @@ metrics_lr <- collect_metrics(lr_res)
 ```
 
 ```{r}
-autoplot(xgb_res)
+autoplot(lr_res)
 ```
 
 ```{r}
@@ -948,57 +932,23 @@ metrics_knn <- collect_metrics(knn_res)
 ```
 
 ```{r}
-autoplot(xgb_res)
+autoplot(knn_res)
 ```
 
-```{r}
-# neural net
-registerDoParallel(detectCores() - 1)
-
-tic()
-set.seed(123)
-
-nnet_res <-
-  tune_bayes(
-    nnet_wf,
-    resamples = train_folds,
-    param_info = nnet_params,
-    iter = 50,
-    metrics = metric_set(rmse),
-    control = control_bayes(
-      no_improve = 15,
-      save_pred = TRUE,
-      save_workflow = TRUE,
-      verbose = TRUE
-    )
-  )
-
-toc()
-
-unregister_dopar()
-
-best_results_nnet <- select_best(nnet_res, metric = "rmse")
-metrics_nnet <- collect_metrics(nnet_res)
-```
-
-```{r}
-autoplot(xgb_res)
-```
 
 ### Test models
-
 
 ```{r}
 # Predict on test data
 
 xgb_best_model <- finalize_model(xgb_spec, best_results_xgb)
-xgb_best_workflow <- xgb_wf %>% update_model(xgb_best_model)
-xgb_best_fit <- fit(xgb_best_workflow, data = train_data)
+xgb_best_workflow <- xgb_wf %>% update_model(xgb_best_model) %>% update_recipe(prediciton_model_rec)
+xgb_best_fit <- fit(xgb_best_workflow, data = train_data %>% select(-score_factor))
 
 xgb_pred <- predict(xgb_best_fit, test_data) %>%
   bind_cols(test_data)
-```
 
+```
 
 ```{r}
 # Prediction results
@@ -1024,8 +974,8 @@ xgb_g1 / xgb_g2
 # Predict on test data
 
 lgbm_best_model <- finalize_model(lgbm_spec, best_results_lgbm)
-lgbm_best_workflow <- lgbm_wf %>% update_model(lgbm_best_model)
-lgbm_best_fit <- fit(lgbm_best_workflow, data = train_data)
+lgbm_best_workflow <- lgbm_wf %>% update_model(lgbm_best_model) %>% update_recipe(prediciton_model_rec)
+lgbm_best_fit <- fit(lgbm_best_workflow, data = train_data %>% select(-score_factor))
 
 lgbm_pred <- predict(lgbm_best_fit, test_data) %>%
   bind_cols(test_data)
@@ -1057,8 +1007,8 @@ lgbm_g1 / lgbm_g2
 # Predict on test data
 
 rf_best_model <- finalize_model(rf_spec, best_results_rf)
-rf_best_workflow <- rf_wf %>% update_model(rf_best_model)
-rf_best_fit <- fit(rf_best_workflow, data = train_data)
+rf_best_workflow <- rf_wf %>% update_model(rf_best_model) %>% update_recipe(prediciton_model_rec)
+rf_best_fit <- fit(rf_best_workflow, data = train_data %>% select(-score_factor))
 
 rf_pred <- predict(rf_best_fit, test_data) %>%
   bind_cols(test_data)
@@ -1089,8 +1039,8 @@ rf_g1 / rf_g2
 # Predict on test data
 
 lr_best_model <- finalize_model(lr_spec, best_results_lr)
-lr_best_workflow <- lr_wf %>% update_model(lr_best_model)
-lr_best_fit <- fit(lr_best_workflow, data = train_data)
+lr_best_workflow <- lr_wf %>% update_model(lr_best_model) %>% update_recipe(prediciton_model_rec_glm)
+lr_best_fit <- fit(lr_best_workflow, data = train_data %>% select(-score_factor))
 
 lr_pred <- predict(lr_best_fit, test_data) %>%
   bind_cols(test_data)
@@ -1121,8 +1071,8 @@ lr_g1 / lr_g2
 # Predict on test data
 
 knn_best_model <- finalize_model(knn_spec, best_results_knn)
-knn_best_workflow <- knn_wf %>% update_model(knn_best_model)
-knn_best_fit <- fit(knn_best_workflow, data = train_data)
+knn_best_workflow <- knn_wf %>% update_model(knn_best_model) %>% update_recipe(prediciton_model_rec)
+knn_best_fit <- fit(knn_best_workflow, data = train_data %>% select(-score_factor))
 
 knn_pred <- predict(knn_best_fit, test_data) %>%
   bind_cols(test_data)
@@ -1149,39 +1099,6 @@ knn_g2 <-
 knn_g1 / knn_g2
 ```
 
-```{r}
-# Predict on test data
-
-nnet_best_model <- finalize_model(nnet_spec, best_results_nnet)
-nnet_best_workflow <- nnet_wf %>% update_model(nnet_best_model)
-nnet_best_fit <- fit(nnet_best_workflow, data = train_data)
-
-nnet_pred <- predict(nnet_best_fit, test_data) %>%
-  bind_cols(test_data)
-```
-
-
-```{r}
-# Prediction results
-nnet_g1 <-
-  nnet_pred %>%
-  ggplot(aes(x = .pred, y = score)) +
-  geom_point() +
-  geom_abline(intercept = 0, col = "red")
-
-
-nnet_g2 <-
-  nnet_pred %>%
-  select(.pred, score) %>%
-  gather(key, value) %>%
-  ggplot(aes(x = value, volor = key, fill = key)) +
-  geom_density(alpha = .2) +
-  labs(x = "", y = "")
-
-nnet_g1 / nnet_g2
-```
-
-As we can see, all models face the same problem: overestimating scores in range from 3.5 to 4.5 and underestimating higher scores.
 
 ## Stack models and Creating Meta Learner
 
@@ -1193,9 +1110,8 @@ lgbm_rmse <- metrics_lgbm %>% inner_join(select_best(lgbm_res, metric = "rmse"))
 rf_rmse <- metrics_rf %>% inner_join(select_best(rf_res, metric = "rmse") ) %>% select(rf = mean)
 lr_rmse <- metrics_lr %>% inner_join(select_best(lr_res, metric = "rmse")) %>% select(lr = mean)
 knn_rmse <- metrics_knn %>% inner_join(select_best(knn_res, metric = "rmse")) %>% select(knn = mean)
-nnet_rmse <- metrics_knn %>% inner_join(select_best(nnet_res, metric = "rmse")) %>% select(nnet = mean)
 
-models_rmse <- cbind(xgb_rmse, lgbm_rmse, rf_rmse, lr_rmse, knn_rmse, nnet_rmse)
+models_rmse <- cbind(xgb_rmse, lgbm_rmse, rf_rmse, lr_rmse, knn_rmse)
 
 best_final_param_xgb <-
   select_best(xgb_res, metric = "rmse") %>%
@@ -1216,10 +1132,6 @@ best_final_param_lr <-
 best_final_param_knn <-
   select_best(knn_res, metric = "rmse") %>%
   select(neighbors:dist_power)
-
-best_final_param_nnet <-
-  select_best(nnet_res, metric = "rmse") %>%
-  select(hidden_units:learn_rate)
 ```
 
 ### Prepare stack dataframe
@@ -1250,17 +1162,11 @@ knn_stack <- knn_res %>%
   inner_join(best_final_param_knn, keep = FALSE) %>%
   select(id, .row, knn = .pred)
 
-nnet_stack <- nnet_res %>%
-  collect_predictions() %>%
-  inner_join(best_final_param_nnet, keep = FALSE) %>%
-  select(id, .row, nnet = .pred)
-
 stack_data <- xgb_stack %>%
   left_join(lgbm_stack) %>%
   left_join(rf_stack) %>%
   left_join(lr_stack) %>%
   left_join(knn_stack) %>%
-  left_join(nnet_stack) %>% 
   select(-.row, -id)
 ```
 
@@ -1307,7 +1213,6 @@ meta_knn_wf <- workflow() %>%
 ### Tune Meta Learners with tune_bayes
 
 ```{r message=FALSE, warning=FALSE}
-# xgboost
 registerDoParallel(detectCores() - 1)
 
 tic()
@@ -1333,7 +1238,7 @@ meta_lgbm_res <-
     meta_lgbm_wf,
     resamples = stack_train_folds,
     param_info = lgbm_params,
-    iter = 30,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -1348,7 +1253,7 @@ meta_rf_res <-
     meta_rf_wf,
     resamples = stack_train_folds,
     param_info = rf_params,
-    iter = 30,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -1363,7 +1268,7 @@ meta_lr_res <-
     meta_lr_wf,
     resamples = stack_train_folds,
     param_info = lr_params,
-    iter = 30,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -1378,7 +1283,7 @@ meta_knn_res <-
     meta_knn_wf,
     resamples = stack_train_folds,
     param_info = knn_params,
-    iter = 30,
+    iter = 50,
     metrics = metric_set(rmse),
     control = control_bayes(
       no_improve = 15,
@@ -1462,18 +1367,225 @@ meta_g2 <-
 meta_g1 / meta_g2
 ```
 
-
 ## Predicting
 
+### Prep test dataset
+
 ```{r}
+test_logs_adj <- time_lags(test_logs, lags)
+
+Missing <- setdiff(lag_cols, names(test_logs_adj)) # Find names of missing columns (mostly due to test data)
+test_logs_adj[Missing] <- 0 # Add them, filled with '0's (mostly due to test data)
+
+
+
+test_logs_1 <- activity_counts(test_logs)
+test_logs_2 <- event_counts(test_logs)
+test_logs_3 <- text_change_counts(test_logs)
+test_logs_4 <- input_words(test_logs)
+
+test_logs_adj <- test_logs_adj %>%
+  group_by(id) %>%
+  mutate(
+    IKI = down_time - lag(down_time, default = 1),
+    action_time_std = sd(action_time, na.rm = TRUE),
+    pause = if_else(IKI >= pause_threshold, 1, 0),
+    is_char = ifelse(text_change != "NoChange", str_length(text_change), 0),
+    is_char = ifelse(is.na(is_char), 1, is_char),
+    p = if_else(IKI <= burst_threshold & activity != "Nonproduction", 1, 0),
+    p_burst = cumsum(p) + 1
+  ) %>%
+  ungroup() %>%
+  group_by(p_burst) %>%
+  mutate(p_burst_length = sum(activity == "Input")) %>%
+  ungroup() %>%
+  left_join(test_logs_1,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(test_logs_2,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(test_logs_3,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  left_join(test_logs_4,
+    join_by(id),
+    keep = FALSE
+  ) %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 1)), # due to lag columns
+    IKI = if_else(IKI <= 0, 1, IKI),
+    action_time_gap25 = if_else(action_time_gap25 <= 0, 1, action_time_gap25),
+    action_time_gap50 = if_else(action_time_gap50 <= 0, 1, action_time_gap50),
+    action_time_gap100 = if_else(action_time_gap100 <= 0, 1, action_time_gap100)
+  )
+
+
+test_df <- test_logs_adj %>%
+  group_by(id) %>%
+  summarize(
+    last_pos = max(cursor_position),
+    total_events = max(event_id),
+    word_count = max(word_count),
+    net_time = round(sum(action_time) / 1000, 0),
+    time = round(max(up_time) / 1000, 0),
+    first_time = round(min(down_time) / 1000, 0),
+    pauses = sum(pause),
+    pauses_share = round(pauses / time, 3),
+    IKI_geometric_mean = exp(mean(log(IKI))),
+    IKI_IQR = IQR(IKI, na.rm = TRUE),
+    IKI_max = max(IKI, na.rm = TRUE),
+    typing_speed = round(word_count / time, 3),
+    p_burst = n_distinct(p_burst),
+    p_burst_per_min = round(p_burst / (net_time / 60), 0),
+    p_burst_length = round(mean(p_burst_length), 0),
+    action_time_gap25_mean = mean(action_time_gap25, na.rm = TRUE),
+    action_time_gap25_geometric_mean = exp(mean(log(action_time_gap25))),
+    action_time_gap25_max = max(action_time_gap25, na.rm = TRUE),
+    action_time_gap50_mean = mean(action_time_gap50, na.rm = TRUE),
+    action_time_gap50_geometric_mean = exp(mean(log(action_time_gap50))),
+    action_time_gap50_max = max(action_time_gap50, na.rm = TRUE),
+    action_time_gap100_max = max(action_time_gap100, na.rm = TRUE),
+    action_time_gap100_mean = mean(action_time_gap100, na.rm = TRUE),
+    action_time_gap100_geometric_mean = exp(mean(log(action_time_gap100))),
+    activity_Input = mean(activity_Input, na.rm = TRUE),
+    activity_Nonproduction = mean(activity_Nonproduction, na.rm = TRUE),
+    activity_Paste = mean(activity_Paste, na.rm = TRUE),
+    `activity_Remove/Cut` = mean(`activity_Remove/Cut`, na.rm = TRUE),
+    activity_Replace = mean(activity_Replace, na.rm = TRUE),
+    `event_'` = mean(`event_'`, na.rm = TRUE),
+    `event_,` = mean(`event_,`, na.rm = TRUE),
+    event_. = mean(event_., na.rm = TRUE),
+    event_ArrowDown = mean(event_ArrowDown, na.rm = TRUE),
+    event_ArrowLeft = mean(event_ArrowLeft, na.rm = TRUE),
+    event_ArrowRight = mean(event_ArrowRight, na.rm = TRUE),
+    event_ArrowUp = mean(event_ArrowUp, na.rm = TRUE),
+    event_Backspace = mean(event_Backspace, na.rm = TRUE),
+    event_CapsLock = mean(event_CapsLock, na.rm = TRUE),
+    event_Delete = mean(event_Delete, na.rm = TRUE),
+    event_Enter = mean(event_Enter, na.rm = TRUE),
+    event_Leftclick = mean(event_Leftclick, na.rm = TRUE),
+    event_q = mean(event_q, na.rm = TRUE),
+    event_Shift = mean(event_Shift, na.rm = TRUE),
+    event_Space = mean(event_Space, na.rm = TRUE),
+    event_Unidentified = mean(event_Unidentified, na.rm = TRUE),
+    `text_change_\n` = mean(`text_change_
+`, na.rm = TRUE),
+    text_change_NoChange = mean(text_change_NoChange, na.rm = TRUE),
+    text_change_q = mean(text_change_q, na.rm = TRUE),
+    input_word_count = mean(input_word_count, na.rm = TRUE),
+    input_word_length_mean = mean(input_word_length_mean, na.rm = TRUE),
+    input_word_length_geometric_mean = mean(input_word_length_geometric_mean, na.rm = TRUE),
+    accuracy = round((activity_Input - activity_Replace - `activity_Remove/Cut`) / activity_Input, 3),
+    words_per_sec = input_word_count / time,
+    words_per_event = input_word_count / total_events,
+    events_per_sec = total_events / time
+  )
 
 
 test_df <- test_df %>% mutate_if(is.numeric, function(x) ifelse(is.infinite(x), 0, x))
 test_df[is.na(test_df)] <- 0
 ```
 
+
+```{r}
+test_df_reduced <- test_df %>%
+  select(-c(
+    accuracy,
+    input_word_length_geometric_mean,
+    pauses_share,
+    activity_Paste,
+    event_Unidentified,
+    event_ArrowUp,
+    event_Delete,
+    event_Enter,
+    event_Leftclick
+  ))
+```
+
+```{r}
+filtered_test_df <- remove_outliers(test_df_reduced)
+```
+
+```{r}
+test_df_reduced_2 <- filtered_test_df %>%
+  select(-c(
+    time,
+    event_ArrowDown,
+    event_ArrowLeft,
+    event_ArrowRight,
+    event_CapsLock,
+    `text_change_
+`,
+    p_burst_per_min
+  ))
+```
+
+
+```{r}
+test_df_reduced_2 <- test_df_reduced_2 %>% clean_names()
+```
+
+
+```{r}
+scaled_test_df <- scale_numeric_columns(test_df_reduced_2)
+
+scaled_test_df <- scaled_test_df %>% mutate_if(is.numeric, function(x) ifelse(is.infinite(x), 0, x))
+scaled_test_df[is.na(scaled_test_df)] <- 0
+```
+
+
+### Predict
+
+
+```{r}
+# predict with 1st layer models
+xgb_pred <- predict(xgb_best_fit, scaled_test_df)
+lgbm_pred <- predict(lgbm_best_fit, scaled_test_df)
+rf_pred <- predict(rf_best_fit, scaled_test_df)
+lr_pred <- predict(lr_best_fit, scaled_test_df)
+knn_pred <- predict(knn_best_fit, scaled_test_df)
+```
+
+```{r}
+prediction_xgb_stack <- xgb_pred %>%
+  bind_cols(scaled_test_df) %>% 
+  select(id, xgb = .pred)
+
+prediction_lgbm_stack <- lgbm_pred %>%
+  bind_cols(scaled_test_df) %>% 
+  select(id, lgbm = .pred)
+
+prediction_rf_stack <- rf_pred %>%
+  bind_cols(scaled_test_df) %>% 
+  select(id, rf = .pred)
+
+prediction_lr_stack <- lr_pred %>%
+  bind_cols(scaled_test_df) %>% 
+  select(id, lr = .pred)
+
+prediction_knn_stack <- knn_pred %>%
+  bind_cols(scaled_test_df) %>% 
+  select(id, knn = .pred)
+
+prediction_stack_data <- prediction_xgb_stack %>%
+  left_join(prediction_lgbm_stack) %>%
+  left_join(prediction_rf_stack) %>%
+  left_join(prediction_lr_stack) %>%
+  left_join(prediction_knn_stack) %>%
+  select(-id)
+```
+
+
+```{r}
+# predict with meta learner
+pred_test <-  predict(meta_best_fit, new_data = prediction_stack_data)
+```
+
+
 ```{r eval=FALSE, include=FALSE}
-pred_test <- predict(model_fit$.workflow[[1]], new_data = test_df)
 
 sample_submission$score <- pred_test$.pred
 write_csv(sample_submission, "submission.csv")
