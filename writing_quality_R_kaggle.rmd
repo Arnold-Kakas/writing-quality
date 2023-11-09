@@ -818,8 +818,7 @@ prediction_stack_data <- prediction_xgb_stack %>%
   left_join(prediction_lgbm_stack) %>%
   left_join(prediction_rf_stack) %>%
   left_join(prediction_lr_stack) %>%
-  left_join(prediction_knn_stack) %>%
-  select(-id)
+  left_join(prediction_knn_stack)
 ```
 
 ### Meta Learner preparation
@@ -846,16 +845,14 @@ meta_lr_wf <- workflow() %>%
 ## Predicting
 
 
-```{r}
-# predict with meta learner
-pred_test <-  predict(meta_lr_wf, new_data = prediction_stack_data)
-```
 
 
 ```{r eval=FALSE, include=FALSE}
+pred_test <-  predict(meta_lr_wf, new_data = prediction_stack_data) %>% cbind(prediction_stack_data) %>% select(c(id, score = .pred))
 
-sample_submission$score <- pred_test$.pred
-write_csv(sample_submission, "submission.csv")
+write_csv(pred_test, "submission.csv")
+
+print("Done")
 ```
 
 
